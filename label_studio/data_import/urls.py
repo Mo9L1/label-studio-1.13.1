@@ -3,6 +3,7 @@
 from django.urls import include, path
 
 from . import api
+from .api import DownloadResourceAPI
 
 app_name = 'data_import'
 
@@ -18,6 +19,7 @@ _api_projects_urlpatterns = [
 ]
 
 urlpatterns = [
+    path('download-resource/', DownloadResourceAPI.as_view(), name='download-resource'),
     path('api/import/', include((_api_urlpatterns, app_name), namespace='api')),
     path('api/projects/', include((_api_projects_urlpatterns, app_name), namespace='api-projects')),
     # special endpoints for serving imported files

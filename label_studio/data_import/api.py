@@ -50,6 +50,63 @@ from .models import FileUpload
 from .serializers import FileUploadSerializer, ImportApiSerializer, PredictionSerializer
 from .uploader import create_file_uploads, load_tasks
 
+from django.db import connection
+import urllib.parse
+from obs import ObsClient, GetObjectHeader
+from django.http import StreamingHttpResponse
+
+
+class DownloadResourceAPI(APIView):
+    permission_classes = (IsAuthenticated,)
+
+    def get(self, request, *args, **kwargs):
+        object_key = request.query_params.get('objectKey')
+        project_id = request.query_params.get('projectId')
+        range = request.query_params.get('range')
+
+        if not object_key or not project_id:
+            return Response({'error': 'URL parameter object_key, project_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT aws_access_key_id, aws_secret_access_key, s3_endpoint, bucket
+                FROM io_storages_s3importstorage
+                WHERE project_id = %s
+            """, [project_id])
+            row = cursor.fetchone()
+
+        if row:
+            ak = row[0]
+            sk = row[1]
+            server = row[2]
+            bucket_name = row[3]
+            obsClient = ObsClient(access_key_id=ak, secret_access_key=sk, server=server)
+            try:
+                # 下载对象的附加请求参数
+                # getObjectRequest = GetObjectRequest()
+                # 获取对象时重写响应中的Content-Type头。
+                headers = GetObjectHeader()
+                headers.range = range
+                resp = obsClient.getObject(bucketName=bucket_name, objectKey=object_key, headers=headers,
+                                           loadStreamInMemory=False)
+                def generate():
+                    # 读取对象内容
+                    while True:
+                        chunk = resp.body.response.read(4096)
+                        if not chunk:
+                            break
+                        else:
+                            yield chunk
+                    resp.body.response.close()
+
+                return StreamingHttpResponse(generate(), content_type='application/octet-stream')
+
+            except Exception as e:
+                return Response({'error': e}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        else:
+            return Response({'error': "aws config not found."}, status=status.HTTP_400_BAD_REQUEST)
+
 logger = logging.getLogger(__name__)
 
 ProjectImportPermission = load_func(settings.PROJECT_IMPORT_PERMISSION)
@@ -784,6 +841,29 @@ class PresignAPIMixin:
         max_age = 0
         if resolved.get('presign_ttl'):
             max_age = resolved.get('presign_ttl') * 60
+
+        if isinstance(instance, Task) and url.startswith(("https://obs", "http://obs")):
+            # 获取Range请求头
+            range_header = request.META.get('HTTP_RANGE', None)
+
+            resource_url = request.build_absolute_uri()
+            parsed_url = urllib.parse.urlparse(url)
+            path_parts = parsed_url.path.strip('/').split('/')
+            object_key = '/'.join(path_parts[1:])
+            if range_header is not None:
+                try:
+                    range = range_header.replace('bytes=', '')
+                except ValueError:
+                    # 如果Range头部格式不正确，则可以处理异常或忽略
+                    return Response({'error': f'wrong range header format: {range_header}.'},
+                                    status=status.HTTP_400_BAD_REQUEST)
+                url = resource_url.split('/tasks')[0] + "/download-resource/?projectId=" + str(instance.project_id) + "&objectKey=" + object_key + "&range=" + range
+            else:
+                url = resource_url.split('/tasks')[0] + "/download-resource/?projectId=" + str(instance.project_id) + "&objectKey=" + object_key
+            response = HttpResponseRedirect(redirect_to=url, status=status.HTTP_303_SEE_OTHER)
+            response.headers['Cache-Control'] = f'no-store, max-age={max_age}'
+
+            return response
 
         # Proxy to presigned url
         response = HttpResponseRedirect(redirect_to=url, status=status.HTTP_303_SEE_OTHER)
