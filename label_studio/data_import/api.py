@@ -62,7 +62,14 @@ class DownloadResourceAPI(APIView):
     def get(self, request, *args, **kwargs):
         object_key = request.query_params.get('objectKey')
         project_id = request.query_params.get('projectId')
-        range = request.query_params.get('range')
+        # 解析 Range 请求头
+        range_header = request.headers.get('Range')
+        if not range_header:
+            range_header = "bytes=0-"
+
+        range_type, range_header = range_header.strip().split('=')
+        if range_type != 'bytes':
+            return Response({'error': 'Invalid range type'}, status=status.HTTP_400_BAD_REQUEST)
 
         if not object_key or not project_id:
             return Response({'error': 'URL parameter object_key, project_id is required'}, status=status.HTTP_400_BAD_REQUEST)
@@ -75,37 +82,57 @@ class DownloadResourceAPI(APIView):
             """, [project_id])
             row = cursor.fetchone()
 
-        if row:
-            ak = row[0]
-            sk = row[1]
-            server = row[2]
-            bucket_name = row[3]
-            obsClient = ObsClient(access_key_id=ak, secret_access_key=sk, server=server)
-            try:
-                # 下载对象的附加请求参数
-                # getObjectRequest = GetObjectRequest()
-                # 获取对象时重写响应中的Content-Type头。
-                headers = GetObjectHeader()
-                headers.range = range
-                resp = obsClient.getObject(bucketName=bucket_name, objectKey=object_key, headers=headers,
-                                           loadStreamInMemory=False)
-                def generate():
-                    # 读取对象内容
-                    while True:
-                        chunk = resp.body.response.read(4096)
-                        if not chunk:
-                            break
-                        else:
-                            yield chunk
-                    resp.body.response.close()
-
-                return StreamingHttpResponse(generate(), content_type='application/octet-stream')
-
-            except Exception as e:
-                return Response({'error': e}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-        else:
+        if not row:
             return Response({'error': "aws config not found."}, status=status.HTTP_400_BAD_REQUEST)
+
+        ak = row[0]
+        sk = row[1]
+        server = row[2]
+        bucket_name = row[3]
+
+        try:
+            obsClient = ObsClient(access_key_id=ak, secret_access_key=sk, server=server)
+            # 获取文件元数据（例如文件大小）
+            metadata = obsClient.getObjectMetadata(bucket_name, object_key)
+            file_size = int(metadata.body.contentLength)
+
+            start, end = range_header.split('-')
+            start = int(start) if start else 0
+            end = int(end) if end else file_size - 1
+
+            # 检查范围是否有效
+            if start >= file_size or end >= file_size or start > end:
+                return Response({'error': 'Invalid range'}, status=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE)
+
+            # 获取指定范围的内容
+            req_headers = GetObjectHeader()
+            req_headers.range = f"{start}-{end}"
+            response = obsClient.getObject(bucket_name, object_key, headers=req_headers, loadStreamInMemory=False)
+            content = response.body
+            content_length = end - start + 1
+            # print(response.header)
+            def generate():
+                # 读取对象内容
+                while True:
+                    chunk = content.response.read(4096)
+                    if not chunk:
+                        break
+                    else:
+                        yield chunk
+                content.response.close()
+            # 设置响应头
+            headers = {
+                'Content-Range': f'bytes {start}-{end}/{file_size}',
+                'Content-Length': str(content_length),
+                'Accept-Ranges': 'bytes',
+                'Content-Type': metadata.body.contentType,
+            }
+            return StreamingHttpResponse(generate(), headers=headers, status=status.HTTP_206_PARTIAL_CONTENT)
+
+        except Exception as e:
+            logger.error(f"Error in DownloadResourceAPI: {str(e)}")
+            return Response({'error': 'Internal server error'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
 
 logger = logging.getLogger(__name__)
 
